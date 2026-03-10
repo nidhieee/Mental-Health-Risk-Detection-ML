@@ -131,7 +131,7 @@ pipeline = get_model()
 # ════════════════════════════════════════════════════════════════════════════
 # UI
 # ════════════════════════════════════════════════════════════════════════════
-st.title("🧠 Stress Level Detector")
+st.title("Stress Level Detector")
 st.caption("Type how you're feeling — we'll assess your stress level and suggest ways to help.")
 
 user_text = st.text_area(
