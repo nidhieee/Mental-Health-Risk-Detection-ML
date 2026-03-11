@@ -131,7 +131,7 @@ pipeline = get_model()
 # ════════════════════════════════════════════════════════════════════════════
 # UI
 # ════════════════════════════════════════════════════════════════════════════
-st.title("🧠 Stress Level Detector")
+st.title("Stress Level Detector")
 st.caption("Type how you're feeling — we'll assess your stress level and suggest ways to help.")
 
 user_text = st.text_area(
@@ -173,30 +173,15 @@ if analyze_btn:
 
         # ── Explanation ───────────────────────────────────────────────────
         st.subheader("🔍 Why this result?")
+        st.write(explanation)
 
-        # Word-based reason
-        st.markdown("**What the model detected:**")
-        st.info(explanation['word_reason'])
-
-        # Confidence score breakdown as two metrics side by side
-        st.markdown("**How the confidence score was calculated:**")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("🔴 High Stress probability", f"{result['prob_high']}%")
-        with col2:
-            st.metric("🟢 Low Stress probability", f"{result['prob_low']}%")
-        st.caption(explanation['confidence_breakdown'])
-
-        # Key word pills with directional arrows
         if top_words:
-            st.markdown("**Key words that influenced the result:**")
+            st.markdown("**Key words detected:**")
             pills = ""
             for w in top_words:
-                css   = 'stress-word' if w['direction'] == 'increases stress' else 'nonstress-word'
-                arrow = '↑' if w['direction'] == 'increases stress' else '↓'
-                pills += f'<span class="word-pill {css}">{arrow} {w["word"]}</span>'
+                css = 'stress-word' if w['direction'] == 'increases stress' else 'nonstress-word'
+                pills += f'<span class="word-pill {css}">{w["word"]}</span>'
             st.markdown(pills, unsafe_allow_html=True)
-            st.caption("↑ pushes toward HIGH STRESS &nbsp;|&nbsp; ↓ pushes toward LOW STRESS")
 
         st.markdown("---")
 
