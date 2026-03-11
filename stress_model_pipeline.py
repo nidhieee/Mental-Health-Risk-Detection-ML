@@ -253,128 +253,197 @@ def train_and_evaluate(df: pd.DataFrame) -> tuple:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 6 — Explainability Layer (SHAP or fallback)
+# STEP 6 — Explainability Layer
 # ════════════════════════════════════════════════════════════════════════════
-def get_top_words_shap(pipeline, text: str, n: int = 5) -> list[dict]:
+
+def _get_clf_coefs(clf):
     """
-    Returns top N words that influenced the prediction using SHAP.
-    Works with Logistic Regression pipelines.
+    Safely extract per-feature coefficients from any classifier type,
+    including calibrated wrappers (CalibratedClassifierCV).
+    Returns array of shape (n_features,) — positive = stress signal.
     """
-    tfidf = pipeline.named_steps['tfidf']
-    clf   = pipeline.named_steps['clf']
+    # Unwrap CalibratedClassifierCV
+    if hasattr(clf, 'calibrated_classifiers_'):
+        inner = clf.calibrated_classifiers_[0].estimator
+        if hasattr(inner, 'coef_'):
+            return inner.coef_[0]
+        if hasattr(inner, 'feature_importances_'):
+            return inner.feature_importances_
 
-    # Transform single text
-    X_vec = tfidf.transform([text])
-
-    explainer = shap.LinearExplainer(clf, X_vec, feature_perturbation="interventional")
-    shap_vals  = explainer.shap_values(X_vec)
-
-    # shap_vals shape: (1, n_features) for binary
-    if isinstance(shap_vals, list):
-        vals = shap_vals[1][0]   # class 1 (stress)
-    else:
-        vals = shap_vals[0]
-
-    feature_names = tfidf.get_feature_names_out()
-    word_shap     = list(zip(feature_names, vals))
-
-    # Filter to words actually present in the input
-    present = set(text.lower().split())
-    word_shap = [(w, v) for w, v in word_shap if w in present]
-
-    # Sort by absolute impact
-    word_shap.sort(key=lambda x: abs(x[1]), reverse=True)
-
-    return [
-        {
-            'word': w,
-            'impact': float(v),
-            'direction': 'increases stress' if v > 0 else 'reduces stress'
-        }
-        for w, v in word_shap[:n]
-    ]
-
-
-def get_top_words_coef(pipeline, text: str, n: int = 5) -> list[dict]:
-    """
-    Fallback explainability using logistic regression coefficients.
-    Works when SHAP is not installed.
-    """
-    tfidf = pipeline.named_steps['tfidf']
-    clf   = pipeline.named_steps['clf']
-
-    feature_names = tfidf.get_feature_names_out()
-
-    # Get coefficients (works for LR; for RF use feature_importances_)
     if hasattr(clf, 'coef_'):
-        coefs = clf.coef_[0]
-    elif hasattr(clf, 'feature_importances_'):
-        coefs = clf.feature_importances_
-    else:
+        return clf.coef_[0]
+
+    if hasattr(clf, 'feature_importances_'):
+        return clf.feature_importances_
+
+    return None
+
+
+def get_top_words(pipeline, cleaned_text: str, n: int = 5) -> list[dict]:
+    """
+    Core explainability: finds which words/phrases from the input most
+    influenced the prediction.
+
+    Strategy:
+    1. Transform the cleaned text through TF-IDF (same as during training).
+    2. Get the feature vector — only non-zero entries are features PRESENT
+       in this input. This is the correct way to find active features.
+    3. Multiply each active feature's TF-IDF weight by its model coefficient.
+       → This gives the actual contribution of each word to the score.
+    4. Sort by absolute contribution to find the most impactful words.
+    """
+    tfidf = pipeline.named_steps['tfidf']
+    clf   = pipeline.named_steps['clf']
+
+    coefs = _get_clf_coefs(clf)
+    if coefs is None:
         return []
 
-    word_to_coef = dict(zip(feature_names, coefs))
+    feature_names = tfidf.get_feature_names_out()
 
-    cleaned_text = clean_reddit_text(text, max_words=200)
-    present_words = set(cleaned_text.split())
+    # Transform → sparse matrix (1, n_features)
+    X_vec = tfidf.transform([cleaned_text])
 
-    scored = [
-        (w, word_to_coef[w])
-        for w in present_words
-        if w in word_to_coef
-    ]
+    # Get indices of non-zero features (words actually present in this text)
+    nonzero_indices = X_vec.nonzero()[1]
+
+    if len(nonzero_indices) == 0:
+        return []
+
+    scored = []
+    for idx in nonzero_indices:
+        tfidf_weight  = X_vec[0, idx]           # how prominent this word is in the text
+        model_coef    = coefs[idx]               # how much the model weights this word
+        contribution  = float(tfidf_weight * model_coef)  # actual push toward stress/calm
+        word          = feature_names[idx]
+        scored.append((word, contribution))
+
+    # Sort by absolute contribution — biggest movers first
     scored.sort(key=lambda x: abs(x[1]), reverse=True)
 
     return [
         {
-            'word': w,
-            'impact': float(v),
-            'direction': 'increases stress' if v > 0 else 'reduces stress'
+            'word'       : word,
+            'impact'     : round(contribution, 4),
+            'direction'  : 'increases stress' if contribution > 0 else 'reduces stress',
         }
-        for w, v in scored[:n]
+        for word, contribution in scored[:n]
     ]
+
+
+def _build_explanation(label: str, confidence: float, top_words: list[dict],
+                        prob_low: float, prob_high: float) -> dict:
+    """
+    Builds a structured, human-readable explanation with multiple parts:
+      - what_it_means : plain-language description of the confidence level
+      - word_reason   : which words drove the result
+      - confidence_breakdown : how the 0–100% score is composed
+    """
+    stress_words    = [w['word'] for w in top_words if w['direction'] == 'increases stress']
+    nonstress_words = [w['word'] for w in top_words if w['direction'] == 'reduces stress']
+
+    # ── Confidence tier description ───────────────────────────────────────
+    if confidence >= 90:
+        conf_desc = "very strong"
+    elif confidence >= 75:
+        conf_desc = "strong"
+    elif confidence >= 60:
+        conf_desc = "moderate"
+    else:
+        conf_desc = "mild"
+
+    # ── Word-based reason sentence ────────────────────────────────────────
+    if label == 'HIGH STRESS':
+        if stress_words:
+            word_reason = (
+                f"The model detected {conf_desc} stress signals. "
+                f"Key words like \"{', '.join(stress_words[:3])}\" carried heavy weight "
+                f"toward a HIGH STRESS prediction."
+            )
+            if nonstress_words:
+                word_reason += (
+                    f" Some calming language was also present "
+                    f"(\"{', '.join(nonstress_words[:2])}\"), "
+                    f"but was outweighed by the stress indicators."
+                )
+        else:
+            word_reason = (
+                f"The model detected a {conf_desc} overall stress pattern "
+                f"across your text, even without single standout words."
+            )
+    else:  # LOW STRESS
+        if nonstress_words:
+            word_reason = (
+                f"The model found {conf_desc} signs of a calm or low-stress state. "
+                f"Words like \"{', '.join(nonstress_words[:3])}\" contributed positively."
+            )
+            if stress_words:
+                word_reason += (
+                    f" Some stress-associated words appeared "
+                    f"(\"{', '.join(stress_words[:2])}\"), "
+                    f"but the overall tone leaned calm."
+                )
+        elif stress_words:
+            word_reason = (
+                f"Some stress-related words were detected "
+                f"(\"{', '.join(stress_words[:2])}\"), "
+                f"but not enough to cross the threshold for HIGH STRESS."
+            )
+        else:
+            word_reason = (
+                f"Your text showed a {conf_desc} low-stress pattern overall."
+            )
+
+    # ── Confidence breakdown explanation ─────────────────────────────────
+    conf_breakdown = (
+        f"The model assigned {prob_high:.1f}% probability to HIGH STRESS "
+        f"and {prob_low:.1f}% to LOW STRESS. "
+        f"It chose {label} as the final prediction because that had the higher score."
+    )
+
+    return {
+        'word_reason'          : word_reason,
+        'confidence_breakdown' : conf_breakdown,
+        'confidence_tier'      : conf_desc,
+        'stress_words'         : stress_words,
+        'nonstress_words'      : nonstress_words,
+    }
 
 
 def explain_prediction(pipeline, raw_text: str, n: int = 5) -> dict:
     """
-    Full prediction + explanation for a single input text.
+    Full prediction + rich explanation for a single input text.
+
     Returns:
-        label       : 'HIGH STRESS' or 'LOW STRESS'
-        confidence  : float 0–1
-        top_words   : list of {word, impact, direction}
-        explanation : human-readable string
+        label                : 'HIGH STRESS' or 'LOW STRESS'
+        confidence           : float (probability of predicted class, 0–100)
+        prob_high            : float (probability of HIGH STRESS, 0–100)
+        prob_low             : float (probability of LOW STRESS, 0–100)
+        top_words            : list of {word, impact, direction}
+        explanation          : dict with word_reason, confidence_breakdown, etc.
     """
     cleaned = clean_reddit_text(raw_text)
 
-    pred    = pipeline.predict([cleaned])[0]
-    prob    = pipeline.predict_proba([cleaned])[0]
-    conf    = float(prob[pred])
-    label   = 'HIGH STRESS' if pred == 1 else 'LOW STRESS'
+    pred     = pipeline.predict([cleaned])[0]
+    probs    = pipeline.predict_proba([cleaned])[0]
 
-    # Choose explainability method
-    try:
-        if SHAP_AVAILABLE and 'LogisticRegression' in type(pipeline.named_steps['clf']).__name__:
-            top_words = get_top_words_shap(pipeline, cleaned, n)
-        else:
-            top_words = get_top_words_coef(pipeline, cleaned, n)
-    except Exception as e:
-        print(f"Explainability warning: {e}")
-        top_words = get_top_words_coef(pipeline, cleaned, n)
+    # predict_proba returns [prob_class0, prob_class1]
+    prob_low  = round(float(probs[0]) * 100, 1)
+    prob_high = round(float(probs[1]) * 100, 1)
+    conf      = round(float(probs[pred]) * 100, 1)
+    label     = 'HIGH STRESS' if pred == 1 else 'LOW STRESS'
 
-    # Build human-readable explanation
-    stress_words    = [w['word'] for w in top_words if w['direction'] == 'increases stress']
-    nonstress_words = [w['word'] for w in top_words if w['direction'] == 'reduces stress']
+    # Get top contributing words
+    top_words = get_top_words(pipeline, cleaned, n)
 
-    if stress_words:
-        explanation = f"Words like \"{', '.join(stress_words[:3])}\" strongly indicate stress."
-    elif nonstress_words:
-        explanation = f"Words like \"{', '.join(nonstress_words[:3])}\" suggest a calm tone."
-    else:
-        explanation = "Based on the overall pattern of your text."
+    # Build rich explanation
+    explanation = _build_explanation(label, conf, top_words, prob_low, prob_high)
 
     return {
         'label'      : label,
-        'confidence' : round(conf * 100, 1),
+        'confidence' : conf,
+        'prob_high'  : prob_high,
+        'prob_low'   : prob_low,
         'top_words'  : top_words,
         'explanation': explanation,
     }
